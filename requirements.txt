@@ -1,0 +1,16 @@
+# Core AI framework
+torch>=2.7.0
+torchvision>=0.22.0
+
+# Object detection
+ultralytics>=8.3.0
+
+# Computer Vision
+opencv-python>=4.10.0
+numpy>=2.0.0
+
+# Live stream support
+streamlink>=7.0.0
+
+# Utilities
+PyYAML>=6.0
