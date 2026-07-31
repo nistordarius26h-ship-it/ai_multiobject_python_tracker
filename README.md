@@ -51,6 +51,15 @@ Originally built and tested using live footage from a DJI Mini 3 drone, the syst
 
 ---
 
+## Requirements
+
+- Python 3.11+
+- Windows or Linux
+- NVIDIA GPU (CUDA), AMD GPU (ROCm/HIP), or CPU
+- Internet connection if using live streams (YouTube Live, RTSP, etc.)
+
+---
+
 ## Hardware
 
 - GPU-accelerated workstation (NVIDIA CUDA or AMD ROCm/HIP)
@@ -76,8 +85,8 @@ media/                # Demo clips, screenshots
 Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/real-time-object-tracking.git
-cd real-time-object-tracking
+git clone https://github.com/nistordarius26h-ship-it/ai_multiobject_python_tracker.git
+cd ai_multiobject_python_tracker
 ```
 
 Install the required packages:
@@ -90,10 +99,27 @@ pip install -r requirements.txt
 >
 > PyTorch with ROCm is **not installed automatically** through `requirements.txt`. Install the appropriate ROCm-enabled PyTorch build for your ROCm version from the official PyTorch installation guide before installing the remaining dependencies.
 
+Install PyTorch:
+
+> Install the appropriate PyTorch build for your hardware:
+
+- **NVIDIA:** CUDA
+- **AMD:** ROCm
+- **CPU:** CPU-only
+
+See the official PyTorch installation guide:
+https://pytorch.org/get-started/locally/
+
 Then verify GPU support:
 
 ```bash
 python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+```
+
+Run the application:
+
+```bash
+python tracker.py
 ```
 
 ---
