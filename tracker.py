@@ -3,87 +3,129 @@ import streamlink
 import time
 import math
 import torch
-from collections import defaultdict, deque
+import queue
+import threading
+from collections import defaultdict , deque
 from ultralytics import YOLO
 
 url = "https://www.youtube.com/-example-"
-model = "yolo11x.pt" # powerfull extra-large model
+modelname = "yolo11x.pt" # powerfull extra-large model
 
-target = [0 , 2 , 3 , 5 , 7 , 16 , 18] # person , car , motorcycle , bus , truck , dog , horse
-config = 0.40 # minimum confidence to keep a detection
-width = 960 # resize width for speed
-traill = 40 # how many past positions to remember per object
-timeout = 2.0 # seconds before a "lost" object is forgotten
-mpp = 0.05 # estimate for km/h raise it if speeds look too slow, lower it if they look too fast.
-smoothing = 0.85 # 0-1 , higher = smoother but slower to react , lower = jumpier but more instant
-grace = 0.5 # seconds to keep drawing a box even if detection drops for a frame or two
-# colors to cycle through for different tracked objects.
+target = [0 , 2 , 3 , 5 , 7 , 16 , 18]
+config = 0.40
+width = 960
+traill = 40
+timeout = 2.0
+mpp = 0.05
+smoothing = 0.85
+grace = 0.5
+
 colours = [
     (0 , 0 , 255) ,
     (255 , 255 , 255) , 
 ]
 
+class queuestream:
+    def __init__(self , cap , maxbuffer = 60):
+        self.cap = cap
+        self.q = queue.Queue(maxsize = maxbuffer)
+        self.stopped = False
+        self.thread = threading.Thread(target = self.reader , daemon = True)
+        self.thread.start()
+
+    def reader(self):
+        while not self.stopped:
+            ok , frame = self.cap.read()
+            if not ok:
+                self.stopped = True
+                break
+            self.q.put((ok , frame))
+
+    def read(self):
+        if self.stopped and self.q.empty():
+            return False , None
+        try:
+            return self.q.get(timeout = 2.0)
+        except queue.Empty:
+            return False , None
+
+    def stop(self):
+        self.stopped = True
+        self.cap.release()
+
 def text(frame , text , x , y , color = (255 , 255 , 255)):
     cv2.putText(frame , text , (x , y) , cv2.FONT_HERSHEY_SIMPLEX , 0.6 , (0 , 0 , 0) , 4 , cv2.LINE_AA)
     cv2.putText(frame , text , (x , y) , cv2.FONT_HERSHEY_SIMPLEX , 0.6 , color , 2 , cv2.LINE_AA)
 
-def colourf(track_id):
-    return colours[track_id % len(colours)] # Pick a consistent color for a given track ID
+def colourf(trackid):
+    return colours[trackid % len(colours)]
 
 print("Checking for GPU...")
 if torch.cuda.is_available():
     device = 0
-    device_name = torch.cuda.get_device_name(0)
+    devicename = torch.cuda.get_device_name(0)
     if torch.version.hip is not None:
-        gpu_kind = "AMD GPU (ROCm)" # torch built with hip means it's an AMD card, not NVIDIA
+        gpukind = "AMD GPU (ROCm)"
     else:
-        gpu_kind = "NVIDIA GPU (CUDA)"
-    print(f"Using {gpu_kind}: {device_name}")
+        gpukind = "NVIDIA GPU (CUDA)"
+    print(f"Using {gpukind}: {devicename}")
 else:
     device = "cpu"
-    device_name = "CPU"
+    devicename = "CPU"
     print("No GPU found, using CPU.")
 
 print("Loading YOLO model...")
-model = YOLO(model)
+model = YOLO(modelname)
 try:
     model.to(device)
 except Exception:
     print("Could not use GPU, switching to CPU.")
     device = "cpu"
-    device_name = "CPU"
+    devicename = "CPU"
 
 print("Connecting to stream...")
 streams = streamlink.streams(url)
 if not streams:
     raise RuntimeError("No stream found.")
+
 cap = cv2.VideoCapture(streams["best"].url)
 cap.set(cv2.CAP_PROP_BUFFERSIZE , 1)
 
-# data we track over time (per object ID)
-lastposition = {} # track_id -> (x, y, time) for speed
-lastbox = {} # track_id -> (x1, y1, x2, y2) last known box, so it doesnt flicker
-lastclass = {} # track_id -> class name, needed to redraw the box during grace period
-speedsmooth = {} # track_id -> smoothed km/h value, so it doesnt jump around
-trail = {} # track_id -> deque of past (x, y) points
-lastseen = {} # track_id -> time last detected (used to clean up)
-fps = 0
-prev_time = time.time()
-start_time = time.time()
+streamfps = cap.get(cv2.CAP_PROP_FPS)
+if streamfps <= 0 or streamfps > 120 or math.isnan(streamfps):
+    streamfps = 30.0
+frameduration = 1.0 / streamfps
+print(f"Tracking locked to stream rate: {streamfps:.1f} FPS ({frameduration * 1000:.1f}ms per frame)")
 
-# loop - runs once per video frame
+stream = queuestream(cap , maxbuffer = 60)
+
+print("Pre-buffering stream...")
+while stream.q.qsize() < 15 and not stream.stopped:
+    time.sleep(0.05)
+print("Buffer filled! Launching tracker.")
+
+lastposition = {}
+lastbox = {}
+lastclass = {}
+speedsmooth = {}
+trail = {}
+lastseen = {}
+fps = 0
+prevtime = time.time()
+starttime = time.time()
+
 while True:
-    ok , frame = cap.read()
-    if not ok:
+    loopstart = time.time()
+
+    ok , frame = stream.read()
+    if not ok or frame is None:
         print("Stream ended.")
         break
 
-    # resize for processing speed   
     h , w = frame.shape[:2]
     scale = width / w
     frame = cv2.resize(frame , (width , int(h * scale)))
 
-    # detection  
     results = model.track(
         frame ,
         device = device ,
@@ -95,100 +137,94 @@ while True:
     )
     result = results[0]
     now = time.time()
-    class_counts = defaultdict(int)
-    tracked_count = 0
+    classcounts = defaultdict(int)
+    trackedcount = 0
 
-    # if found   
     if result.boxes.id is not None:
         ids = result.boxes.id.cpu().numpy().astype(int)
         boxes = result.boxes.xyxy.cpu().numpy()
         classes = result.boxes.cls.cpu().numpy().astype(int)
-        for track_id , box , cls in zip(ids , boxes , classes):
-            x1 , y1 , x2 , y2 = map(int, box)
-            class_name = model.names[cls]
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
+        for trackid , box , cls in zip(ids , boxes , classes):
+            x1 , y1 , x2 , y2 = map(int , box)
+            classname = model.names[cls]
+            centerx = (x1 + x2) // 2
+            centery = (y1 + y2) // 2
 
-            # speed   
             rawspeed = 0
-            if track_id in lastposition:
-                prev_x , prev_y , prev_t = lastposition[track_id]
-                dt = max(now - prev_t, 1e-6)
-                pixels_moved = math.hypot(center_x - prev_x , center_y - prev_y)
-                speed_px_per_sec = pixels_moved / dt
-                rawspeed = speed_px_per_sec * mpp * 3.6
+            if trackid in lastposition:
+                prevx , prevy , prevt = lastposition[trackid]
+                dt = max(now - prevt , 1e-6)
+                pixelsmoved = math.hypot(centerx - prevx , centery - prevy)
+                speedpxpersec = pixelsmoved / dt
+                rawspeed = speedpxpersec * mpp * 3.6
 
-            # blend the old smoothed value with the new raw reading so it doesnt jump   
-            if track_id in speedsmooth:
-                speedsmooth[track_id] = speedsmooth[track_id] * smoothing + rawspeed * (1 - smoothing)
+            if trackid in speedsmooth:
+                speedsmooth[trackid] = speedsmooth[trackid] * smoothing + rawspeed * (1 - smoothing)
             else:
-                speedsmooth[track_id] = rawspeed
+                speedsmooth[trackid] = rawspeed
 
-            lastposition[track_id] = (center_x , center_y , now)
-            lastbox[track_id] = (x1 , y1 , x2 , y2)
-            lastclass[track_id] = class_name
-            lastseen[track_id] = now
+            lastposition[trackid] = (centerx , centery , now)
+            lastbox[trackid] = (x1 , y1 , x2 , y2)
+            lastclass[trackid] = classname
+            lastseen[trackid] = now
 
-            # motion trail
-            if track_id not in trail:
-                trail[track_id] = deque(maxlen = traill)
-            trail[track_id].append((center_x, center_y))
+            if trackid not in trail:
+                trail[trackid] = deque(maxlen = traill)
+            trail[trackid].append((centerx , centery))
 
-    # objects to draw this frame: seen just now , plus objects seen very recently   
-    # (within "grace" seconds) that got missed this exact frame - stops the box   
-    # from flickering on and off when YOLO briefly loses a detection   
     idstodraw = [tid for tid , t in lastseen.items() if now - t <= grace]
-    tracked_count = len(idstodraw)
+    trackedcount = len(idstodraw)
 
-    for track_id in idstodraw:
-        x1 , y1 , x2 , y2 = lastbox[track_id]
-        class_name = lastclass[track_id]
-        color = colourf(track_id)
-        class_counts[class_name] += 1
+    for trackid in idstodraw:
+        x1 , y1 , x2 , y2 = lastbox[trackid]
+        classname = lastclass[trackid]
+        color = colourf(trackid)
+        classcounts[classname] += 1
 
-        # draw the trail as a connected line
-        points = list(trail[track_id])
+        points = list(trail[trackid])
         for i in range(1 , len(points)):
             cv2.line(frame , points[i - 1] , points[i] , color , 2)
 
-        # draw the box and labels using the smoothed speed
         cv2.rectangle(frame , (x1 , y1) , (x2 , y2) , color , 2)
-        text(frame , f"{class_name} #{track_id}" , x1 , max(15 , y1 - 15) , color)
-        text(frame , f"~{speedsmooth[track_id]:.0f} km/h", x1 , y2 + 20 , color)
+        text(frame , f"{classname} #{trackid}" , x1 , max(15 , y1 - 15) , color)
+        text(frame , f"~{speedsmooth[trackid]:.0f} km/h" , x1 , y2 + 20 , color)
 
-    # forget objects   
-    for track_id in list(lastseen.keys()):
-        if now - lastseen[track_id] > timeout:
-            del lastseen[track_id]
-            lastposition.pop(track_id , None)
-            lastbox.pop(track_id , None)
-            lastclass.pop(track_id , None)
-            speedsmooth.pop(track_id , None)
-            trail.pop(track_id , None)
+    for trackid in list(lastseen.keys()):
+        if now - lastseen[trackid] > timeout:
+            del lastseen[trackid]
+            lastposition.pop(trackid , None)
+            lastbox.pop(trackid , None)
+            lastclass.pop(trackid , None)
+            speedsmooth.pop(trackid , None)
+            trail.pop(trackid , None)
 
-    current_time = time.time()
-    fps = fps * 0.9 + (1 / (current_time - prev_time)) * 0.1
-    prev_time = current_time
-    runtime = int(current_time - start_time)
+    currenttime = time.time()
+    fps = fps * 0.9 + (1 / max(currenttime - prevtime , 1e-6)) * 0.1
+    prevtime = currenttime
+    runtime = int(currenttime - starttime)
 
     y = 30
     for line in [
-        f"Device: {device_name}" ,
+        f"Device: {devicename}" ,
         f"FPS: {fps:.1f}" ,
-        f"Tracked: {tracked_count}" ,
+        f"Tracked: {trackedcount}" ,
         f"Runtime: {runtime}s" ,
     ]:
         text(frame , line , 15 , y)
         y = y + 26
     y = y + 6
-    for name , count in sorted(class_counts.items()):
+    for name , count in sorted(classcounts.items()):
         text(frame , f"{name}: {count}" , 15 , y , (0 , 255 , 255))
         y = y + 22
 
-    # result   
     cv2.imshow("Drone AI Tracker" , frame)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
-cap.release() # cleanup
+    elapsed = time.time() - loopstart
+    sleepneeded = frameduration - elapsed
+    if sleepneeded > 0:
+        time.sleep(sleepneeded)
+
+stream.stop()
 cv2.destroyAllWindows()
